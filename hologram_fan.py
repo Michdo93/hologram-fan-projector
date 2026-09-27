@@ -1,403 +1,623 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-hologram_fan.py — Python-Schnittstelle für 3D-Hologramm-Ventilator
-====================================================================
-Protokoll: TCP auf Port 50200 (binäre Befehle)
-Voraussetzung: Gleiches WLAN wie das Gerät ODER direkt mit dem
-               WLAN-Hotspot des Geräts verbunden (IP: 10.10.10.1)
+hologram_fan.py — Python-Steuerung fuer 3D-Hologramm-Luefter (LED-Blade / POV Fan)
+der Bauart "3D_42CM_..." (Windows-App "电脑软件 V13.0" / "Windows app V13.0").
 
-Drittanbieter-Steuerung muss in den Geräteeinstellungen aktiviert
-und das Gerät danach neu gestartet werden!
+Reverse-engineered aus dem originalen Windows-Binary. Gesicherter Stand:
 
-Dateien hochladen: Per FTP oder HTTP auf Port 8080 (je nach Firmware).
-Wenn dein Gerät eine andere Methode nutzt, tracke den Traffic mit
-Wireshark während du die offizielle App verwendest.
+  * Transport : TCP, Geraet ist AP-Server auf 192.168.4.1:20320  (Port 0x4F60)
+  * Framing   : ASCII-Rahmen HEAD ... FOOT
+                  HEAD = b"C0EEB7C9BAA3"   (GBK-Hex von 李飞海 = Autor "Li Feihai")
+                  FOOT = b"C0EEBDF9E5B7"   (GBK-Hex von 李靳宸)
+                Zweite Kommando-Familie (Datei/Upload) nutzt Praefix
+                  b"B2DDDDED"              (GBK-Hex von 草蓓)
+  * Handshake : nur HEAD+FOOT-Signatur senden -> Geraet liefert Datei-/Animationsliste.
 
-Unbekannte Befehle? → Wireshark auf deinem PC laufen lassen,
-die offizielle App benutzen, und die TCP-Pakete an Port 50200 ablesen.
+Der Listen-Parser ist gegen einen echten Geraete-Mitschnitt verifiziert
+(siehe test_parse() am Ende).
+
+Autor-Kontext: passt in die Geraete-Repo-Reihe (BenQ-RS232-TCP,
+Brother-VC-500W, LogiLink-WC0030A-Python ...).
 """
 
+from __future__ import annotations
 import socket
+import threading as _threading
 import time
-import os
-import ftplib
-import threading
-from pathlib import Path
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+DEFAULT_IP   = "192.168.4.1"
+DEFAULT_PORT = 20320
+
+HEAD = b"C0EEB7C9BAA3"          # 李飞海
+FOOT = b"C0EEBDF9E5B7"          # 李靳宸
+FILE_PREFIX = b"B2DDDDED"       # 草蓓  (Datei-/Upload-Familie)
+
+RECV_MAX = 1460                 # recv-Puffer der Original-App (0x5B4)
 
 
-# ─────────────────────────────────────────────
-#  Bekannte Befehle (0x5B = Startbyte)
-#  Ergänze hier weitere, wenn du sie per
-#  Wireshark aus der App herausliest!
-# ─────────────────────────────────────────────
-COMMANDS = {
-    "power_on":     bytes([0x5B, 0x01, 0x00]),
-    "power_off":    bytes([0x5B, 0x02, 0x00]),
-    "stop":         bytes([0x5B, 0x03, 0x00]),
-    "play":         bytes([0x5B, 0x04, 0x00]),
-    "pause":        bytes([0x5B, 0x05, 0x00]),
-    "next":         bytes([0x5B, 0x06, 0x00]),
-    "previous":     bytes([0x5B, 0x07, 0x00]),
-    "volume_up":    bytes([0x5B, 0x08, 0x00]),
-    "volume_down":  bytes([0x5B, 0x09, 0x00]),
-    # Geschwindigkeit — viele Geräte erwarten den Wert im 3. Byte
-    # Typischer Bereich: 0x01 (langsam) bis 0x05 (schnell)
-    # Diese müssen ggf. per Wireshark verifiziert werden:
-    "speed_1":      bytes([0x5B, 0x0A, 0x01]),
-    "speed_2":      bytes([0x5B, 0x0A, 0x02]),
-    "speed_3":      bytes([0x5B, 0x0A, 0x03]),
-    "speed_4":      bytes([0x5B, 0x0A, 0x04]),
-    "speed_5":      bytes([0x5B, 0x0A, 0x05]),
-    # Helligkeit (falls unterstützt)
-    "brightness_low":  bytes([0x5B, 0x0B, 0x01]),
-    "brightness_mid":  bytes([0x5B, 0x0B, 0x02]),
-    "brightness_high": bytes([0x5B, 0x0B, 0x03]),
-}
+@dataclass
+class FanFile:
+    """Ein Eintrag der Animations-/Videoliste auf der SD-Karte."""
+    name: str                   # GBK-dekodierter Dateiname, z.B. "0鱼", "4TIGER"
+    index: Optional[int]        # fuehrende Ziffer im Namen, falls vorhanden (Play-Index)
+    raw: bytes                  # Rohbytes (GBK) des Namens
+
+    def __str__(self) -> str:
+        idx = "" if self.index is None else f"[{self.index}] "
+        return f"{idx}{self.name}"
+
+
+@dataclass
+class FanStatus:
+    """Aus dem Status-Trailer der Listenantwort."""
+    file_count: int
+    flags: bytes = field(default=b"")
 
 
 class HologramFan:
     """
-    Steuert einen WiFi-Hologramm-Ventilator über TCP.
+    Minimaler, blockierender TCP-Client.
 
-    Schnellstart:
-        fan = HologramFan("10.10.10.1")   # Hotspot-Modus
-        # oder
-        fan = HologramFan("192.168.1.42") # Router-Modus (IP aus Router-DHCP ablesen)
-
+    Verwendung:
+        fan = HologramFan()          # 192.168.4.1:20320
         fan.connect()
-        fan.play()
-        fan.set_speed(3)
-        fan.stop()
-        fan.disconnect()
+        files, status = fan.get_file_list()
+        for f in files:
+            print(f)
+        fan.close()
 
-    Als Context-Manager:
-        with HologramFan("10.10.10.1") as fan:
-            fan.play()
-            time.sleep(10)
-            fan.next_video()
+    oder als Kontext-Manager:
+        with HologramFan() as fan:
+            print(fan.get_file_list()[0])
     """
 
-    CONTROL_PORT = 50200
-    FTP_PORT = 21          # Falls FTP-Upload unterstützt wird
-    HTTP_PORT = 8080       # Falls HTTP-Upload unterstützt wird
-
-    def __init__(self, host: str, port: int = CONTROL_PORT, timeout: float = 5.0):
-        self.host = host
+    def __init__(self, ip: str = DEFAULT_IP, port: int = DEFAULT_PORT,
+                 timeout: float = 3.0, verbose: bool = False):
+        self.ip = ip
         self.port = port
         self.timeout = timeout
-        self._sock: socket.socket | None = None
-        self._connected = False
+        self.verbose = verbose
+        self._sock: Optional[socket.socket] = None
+        self._lock = _threading.Lock()
+        self._running = False
+        self._rx_thread: Optional[_threading.Thread] = None
+        self._ka_thread: Optional[_threading.Thread] = None
+        self._last_rx = b""
 
-    # ── Verbindung ──────────────────────────────────────────────────
+    # ---- Verbindung / warme Sitzung ------------------------------------
+    # Erkenntnis aus den Einzelmitschnitten: das Geraet sendet die Liste
+    # von SELBST periodisch (~alle 10 s) und antwortet NICHT direkt auf
+    # jedes Kommando. Die App feuert Kommandos fire-and-forget und haelt
+    # die Verbindung mit staendigem Polling warm. Genau das macht open():
+    # eine dauerhafte Verbindung + Reader-Thread (draint eingehende Daten)
+    # + Keepalive-Thread (pollt regelmaessig mit HEAD+FOOT).
+    def connect(self) -> None:
+        self.close()
+        self._sock = socket.create_connection((self.ip, self.port), self.timeout)
 
-    def connect(self) -> bool:
-        """Verbindet zum Gerät. Gibt True zurück bei Erfolg."""
-        try:
-            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self._sock.settimeout(self.timeout)
-            self._sock.connect((self.host, self.port))
-            self._connected = True
-            print(f"✅  Verbunden mit {self.host}:{self.port}")
-            return True
-        except (socket.timeout, ConnectionRefusedError, OSError) as e:
-            print(f"❌  Verbindung fehlgeschlagen: {e}")
-            self._connected = False
-            return False
-
-    def disconnect(self):
-        """Trennt die Verbindung."""
-        if self._sock:
-            try:
-                self._sock.close()
-            except OSError:
-                pass
-            self._sock = None
-        self._connected = False
-        print("🔌  Verbindung getrennt.")
-
-    def __enter__(self):
+    def open(self) -> "HologramFan":
+        """Warme Sitzung starten (Verbindung + Reader + Keepalive)."""
         self.connect()
+        self._running = True
+        self._rx_thread = _threading.Thread(target=self._rx_loop, daemon=True)
+        self._ka_thread = _threading.Thread(target=self._ka_loop, daemon=True)
+        self._rx_thread.start()
+        self._ka_thread.start()
+        self._raw(HEAD + FOOT)          # initialer Handshake
+        time.sleep(0.4)
         return self
 
-    def __exit__(self, *args):
-        self.disconnect()
-
-    # ── Rohe Befehlsübertragung ─────────────────────────────────────
-
-    def send_raw(self, data: bytes) -> bytes | None:
-        """Sendet rohe Bytes und gibt die Antwort zurück (falls vorhanden)."""
-        if not self._connected or not self._sock:
-            print("⚠️   Nicht verbunden. Bitte zuerst connect() aufrufen.")
-            return None
-        try:
-            self._sock.sendall(data)
-            # Kurz auf Antwort warten (nicht alle Geräte antworten)
+    def close(self) -> None:
+        self._running = False
+        s, self._sock = self._sock, None
+        if s is not None:
             try:
-                response = self._sock.recv(256)
-                return response
-            except socket.timeout:
-                return b""  # Kein Fehler — Gerät sendet nichts zurück
-        except OSError as e:
-            print(f"❌  Sendefehler: {e}")
-            self._connected = False
-            return None
-
-    def send_command(self, name: str) -> bool:
-        """Sendet einen benannten Befehl aus der COMMANDS-Tabelle."""
-        cmd = COMMANDS.get(name)
-        if cmd is None:
-            print(f"⚠️   Unbekannter Befehl: '{name}'")
-            print(f"     Verfügbare Befehle: {list(COMMANDS.keys())}")
-            return False
-        resp = self.send_raw(cmd)
-        if resp is not None:
-            print(f"▶   {name}: gesendet {cmd.hex(' ')} → Antwort: {resp.hex(' ') or '(keine)'}")
-            return True
-        return False
-
-    # ── Komfortmethoden ─────────────────────────────────────────────
-
-    def power_on(self):
-        return self.send_command("power_on")
-
-    def power_off(self):
-        return self.send_command("power_off")
-
-    def play(self):
-        return self.send_command("play")
-
-    def stop(self):
-        return self.send_command("stop")
-
-    def pause(self):
-        return self.send_command("pause")
-
-    def next_video(self):
-        return self.send_command("next")
-
-    def previous_video(self):
-        return self.send_command("previous")
-
-    def set_speed(self, level: int):
-        """Setzt die Rotationsgeschwindigkeit. level: 1 (langsam) bis 5 (schnell)."""
-        if not 1 <= level <= 5:
-            print("⚠️   Geschwindigkeit muss zwischen 1 und 5 liegen.")
-            return False
-        return self.send_command(f"speed_{level}")
-
-    def set_brightness(self, level: str):
-        """Setzt die Helligkeit. level: 'low', 'mid', 'high'."""
-        key = f"brightness_{level}"
-        if key not in COMMANDS:
-            print(f"⚠️   Ungültige Helligkeit: '{level}'. Wähle 'low', 'mid' oder 'high'.")
-            return False
-        return self.send_command(key)
-
-    def play_file_by_index(self, index: int):
-        """
-        Spielt eine Datei anhand ihres Index auf der SD-Karte ab.
-        Das 3. Byte ist der Dateiindex (0-basiert).
-        ⚠️  Diese Methode muss ggf. per Wireshark verifiziert werden!
-        """
-        cmd = bytes([0x5B, 0x10, index & 0xFF])
-        resp = self.send_raw(cmd)
-        print(f"▶   play_index({index}): {cmd.hex(' ')} → {resp.hex(' ') if resp else '(keine Antwort)'}")
-
-    # ── Datei-Upload (FTP-basiert) ───────────────────────────────────
-
-    def upload_file_ftp(self, local_path: str, remote_name: str | None = None) -> bool:
-        """
-        Lädt eine Datei per FTP auf das Gerät hoch.
-        Funktioniert nur, wenn dein Gerät FTP unterstützt.
-        remote_name: Dateiname auf dem Gerät (Standard: gleicher Name wie lokal)
-
-        Tipp: Dateiformat .bin wird oft benötigt — konvertiere MP4/AVI
-              zuerst mit der mitgelieferten PC-Software in .bin.
-        """
-        path = Path(local_path)
-        if not path.exists():
-            print(f"❌  Datei nicht gefunden: {local_path}")
-            return False
-
-        remote = remote_name or path.name
-        print(f"📤  FTP-Upload: {path.name} → {self.host}/{remote} ...")
-
-        try:
-            with ftplib.FTP() as ftp:
-                ftp.connect(self.host, self.FTP_PORT, timeout=int(self.timeout))
-                ftp.login()  # Anonym; ggf. user/passwort ergänzen
-                with open(path, "rb") as f:
-                    ftp.storbinary(f"STOR {remote}", f)
-            print(f"✅  Upload abgeschlossen: {remote}")
-            return True
-        except ftplib.all_errors as e:
-            print(f"❌  FTP-Fehler: {e}")
-            print("    → Prüfe ob dein Gerät FTP unterstützt oder nutze die offizielle App.")
-            return False
-
-    def list_files_ftp(self) -> list[str]:
-        """Listet alle Dateien auf dem Gerät (FTP)."""
-        try:
-            with ftplib.FTP() as ftp:
-                ftp.connect(self.host, self.FTP_PORT, timeout=int(self.timeout))
-                ftp.login()
-                files = ftp.nlst()
-                print("📂  Dateien auf dem Gerät:")
-                for f in files:
-                    print(f"    {f}")
-                return files
-        except ftplib.all_errors as e:
-            print(f"❌  FTP-Fehler: {e}")
-            return []
-
-    # ── Geräte-Discovery ────────────────────────────────────────────
-
-    @staticmethod
-    def discover(subnet: str = "192.168.1", port: int = CONTROL_PORT,
-                 timeout: float = 0.5) -> list[str]:
-        """
-        Sucht Hologramm-Ventilatoren im lokalen Netzwerk.
-        Probiert alle 254 Adressen im Subnetz (z.B. '192.168.1').
-
-        Beispiel:
-            gefundene = HologramFan.discover("192.168.178")
-        """
-        print(f"🔍  Suche Geräte in {subnet}.0/24 auf Port {port} ...")
-        found = []
-        lock = threading.Lock()
-
-        def try_connect(ip: str):
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(timeout)
-                result = s.connect_ex((ip, port))
                 s.close()
-                if result == 0:
-                    with lock:
-                        found.append(ip)
-                        print(f"    ✅  Gerät gefunden: {ip}")
             except OSError:
                 pass
 
-        threads = [threading.Thread(target=try_connect, args=(f"{subnet}.{i}",))
-                   for i in range(1, 255)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+    def __enter__(self) -> "HologramFan":
+        return self.open()
 
-        if not found:
-            print("    ❌  Kein Gerät gefunden. Prüfe WLAN-Verbindung und IP-Subnetz.")
-        return found
+    def __exit__(self, *exc) -> None:
+        self.close()
 
+    def _raw(self, data: bytes) -> None:
+        with self._lock:
+            s = self._sock
+            if s is not None:
+                s.sendall(data)
+        if self.verbose:
+            print(f"    TX {data[len(HEAD):data.rfind(FOOT)].hex(' ') if HEAD in data else data.hex(' ')}")
 
-# ─────────────────────────────────────────────────────────────────
-#  Interaktive Demo / Kommandozeile
-# ─────────────────────────────────────────────────────────────────
+    def _rx_loop(self) -> None:
+        while self._running:
+            s = self._sock
+            if s is None:
+                break
+            try:
+                s.settimeout(0.5)
+                d = s.recv(RECV_MAX)
+                if not d:
+                    break
+                self._last_rx = d
+                if self.verbose and HEAD in d:
+                    inner = d[d.find(HEAD) + len(HEAD):d.rfind(FOOT)]
+                    kind = "LISTE" if inner[:4] == b"\x00gpi" else "RX"
+                    print(f"    {kind} {inner[:16].hex(' ')}")
+            except socket.timeout:
+                continue
+            except OSError:
+                break
 
-def interactive_cli(fan: HologramFan):
-    """Einfaches interaktives Terminal zur Steuerung."""
-    print("\n" + "="*50)
-    print("  Hologramm-Ventilator Steuerung")
-    print("="*50)
-    print("Befehle: on, off, play, stop, pause, next, prev,")
-    print("         speed <1-5>, bright <low/mid/high>,")
-    print("         index <n>, raw <hex z.B. 5B 01 00>,")
-    print("         upload <dateipfad>, list, quit")
-    print("="*50)
+    def _ka_loop(self) -> None:
+        while self._running:
+            time.sleep(1.2)
+            try:
+                self._raw(HEAD + FOOT)
+            except OSError:
+                break
 
-    while True:
+    # ---- Kommando ausfuehren -------------------------------------------
+    def command(self, payload: bytes, read: bool = True) -> bytes:
+        """
+        Kommando senden. Laeuft eine warme Sitzung, wird nur gesendet
+        (fire-and-forget, wie die App). Sonst wird fuer diesen einen Aufruf
+        kurz eine warme Sitzung geoeffnet, das Kommando (mehrfach) gesendet
+        und die Verbindung nach kurzem Nachlauf geschlossen.
+        """
+        frame = self.frame(payload)
+        if self._running:
+            self._raw(frame)
+            time.sleep(0.15)
+            return self._last_rx
+        # Einzelaufruf: temporaere warme Sitzung
+        self.open()
         try:
-            cmd = input("\n> ").strip().lower()
-        except (KeyboardInterrupt, EOFError):
-            break
+            for _ in range(3):          # App sendet meist mehrfach
+                self._raw(frame)
+                time.sleep(0.2)
+            time.sleep(1.2)             # Nachlauf, Keepalive haelt Sitzung
+        finally:
+            self.close()
+        return self._last_rx
 
-        if cmd in ("quit", "exit", "q"):
+    def send_raw(self, payload: bytes) -> None:
+        self._raw(payload)
+
+    def request(self, payload: bytes, max_bytes: int = RECV_MAX) -> bytes:
+        """Kommando in warmer Sitzung senden und letzte Geraeteantwort lesen."""
+        if self._running:
+            self._raw(payload)
+            time.sleep(0.3)
+            return self._last_rx
+        self.open()
+        try:
+            self._raw(payload)
+            time.sleep(0.6)
+            return self._last_rx
+        finally:
+            self.close()
+
+    # ---- Kommandos ------------------------------------------------------
+    def get_file_list(self) -> tuple[List[FanFile], Optional[FanStatus]]:
+        """Liste holen. Nutzt warme Sitzung; das Geraet pusht die Liste."""
+        resp = self.request(HEAD + FOOT)
+        return parse_file_list(resp)
+
+    # ---- Kommando-Framing (vollstaendig aus dem Binary rekonstruiert) ---
+    # Jedes Steuerkommando der Original-App hat die Form
+    #     HEAD + check3(len) + payload + FOOT
+    # check3 haengt NUR von der payload-Laenge ab (bit-genau nachgebildet,
+    # siehe _check3). Der Handshake get_file_list() ist der Sonderfall
+    # payload="" (HEAD+FOOT).
+    #
+    # Aus dem Binary extrahiertes Kommando-Vokabular (Semantik teils noch
+    # empirisch zu bestaetigen, Mechanik gesichert):
+    #   1-Byte  : Buchstaben  a c d e h l g m p q j k r
+    #   2-Byte  : {'A'|'B', wert} und {'C', wert}
+    #   5-Byte  : 'b' + int32(little-endian)   (Zeit-/Range-Einstellungen)
+
+    @staticmethod
+    def _check3(length: int) -> bytes:
+        """3 Pruefbytes = f(payload-Laenge). Nachbau der Compiler-Arithmetik."""
+        def s32(x):
+            x &= 0xFFFFFFFF
+            return x - 0x100000000 if x & 0x80000000 else x
+        def imul_hi(a, b):
+            return s32((s32(a) * s32(b) >> 32) & 0xFFFFFFFF)
+        n = s32(length)
+        q1 = s32(((imul_hi(n, 0x06572EC3) >> 3) +
+                  ((imul_hi(n, 0x06572EC3) >> 3) >> 31 & 1)) & 0xFFFFFFFF)
+        q2 = s32(((imul_hi(n, 0x78787879) >> 3) +
+                  ((imul_hi(n, 0x78787879) >> 3) >> 31 & 1)) & 0xFFFFFFFF)
+        b0 = q1 & 0xFF
+        b1 = (int(q2 - int(q2 / 19) * 19) + 0x63) & 0xFF
+        rem = s32(n - q1 * 323)
+        b2 = (int(rem - int(rem / 17) * 17) + 0x62) & 0xFF
+        return bytes([b0, b1, b2])
+
+    def frame(self, payload: bytes) -> bytes:
+        """Vollstaendigen Kommando-Rahmen bauen."""
+        return HEAD + self._check3(len(payload)) + payload + FOOT
+
+    # --- getippte Kommando-Formen (aus Wireshark-Mitschnitt verifiziert) -
+    def button(self, letter: str, read: bool = True) -> bytes:
+        """
+        1-Byte-Button-Kommando. Verifizierte Buchstaben (Message-Map +
+        Einzelmitschnitte): a c d e g h l m p q  (Binary kennt auch j k).
+        Antwort wird gelesen, damit die Sitzung gesund bleibt.
+        """
+        assert len(letter) == 1
+        return self.command(letter.encode("ascii"), read)
+
+    def set_duration(self, seconds: int, read: bool = False) -> bytes:
+        """
+        Videodauer setzen (5..30 s). VERIFIZIERT: 'C' + <sekunden-byte>.
+        (Mitschnitt: 'C' 0x14 -> 20 s.)
+        """
+        s = max(5, min(30, int(seconds)))
+        return self.command(b"C" + bytes([s]), read)
+
+    def set_param(self, value: int, sub: int, pid: int,
+                  read: bool = False) -> bytes:
+        """
+        5-Byte-Parameter-Setter: 'b' + [lo, hi, sub, id].
+        Aus dem Mitschnitt:
+            id=0            -> Zeit/Position-Poll (Heartbeat, lo|hi<<8 = Sekunden)
+            id in {1,2,3,4} -> Einstellungen (Uhr/Zeiger/Ziffern/Uhrzeit)
+        value wird als 16-bit little-endian in lo/hi geschrieben.
+        Exakte Feldsemantik je id noch zu kartieren.
+        """
+        v = int(value) & 0xFFFF
+        payload = bytes([ord("b"), v & 0xFF, (v >> 8) & 0xFF,
+                         sub & 0xFF, pid & 0xFF])
+        return self.command(payload, read)
+
+    # --- Datei-/BIN-Upload (Familie 草蓓) --------------------------------
+    def upload_begin(self, read: bool = True) -> bytes:
+        """
+        Upload-Handshake der Datei-Familie: PREFIX + FOOT (ohne Nutzdaten).
+        Genau das sendet die Original-App zu Beginn eines Uploads
+        (im Mitschnitt 2x, danach ohne Datenfluss abgebrochen).
+        """
+        return self.request(FILE_PREFIX + FOOT)
+
+    def build_file_frame(self, data: bytes) -> bytes:
+        """
+        Datenrahmen der Upload-Familie: PREFIX + HEAD + check3 + data + FOOT.
+        (Datenphase noch nicht mitgeschnitten -> gegen Geraet zu verifizieren.)
+        """
+        return FILE_PREFIX + self.frame(data)
+
+    # === Benannte Funktionen ============================================
+    # Alle folgenden Zuordnungen sind in den Einzel-Mitschnitten byte-genau
+    # bestaetigt (je eine .pcapng pro Funktion). Buchstabe -> Aktion aus der
+    # MFC-Message-Map des Binaries.
+    #
+    # Sichere 1-Byte-Buttons (in probe verwendet):
+    SAFE_LETTERS = "acdeghlmpq"
+
+    # --- Wiedergabe & Navigation ---
+    def on_off(self):          return self.button("a")   # Toggle An/Aus
+    def play_pause(self):      return self.button("e")   # Toggle Play/Pause
+    def next_one(self):        return self.button("c")   # naechstes Video
+    def last_one(self):        return self.button("d")   # vorheriges Video
+    def single_loop(self):     return self.button("g")   # Einzelwiederholung
+    def list_loop(self):       return self.button("h")   # Listenwiederholung
+    def brightness_up(self):   return self.button("m")   # Helligkeit +
+    def brightness_down(self): return self.button("l")   # Helligkeit -
+    def cw_adjust(self):       return self.button("p")   # Drehung im Uhrzeigersinn
+    def ccw_adjust(self):      return self.button("q")   # Drehung gegen Uhrzeigersinn
+
+    # --- GEFAEHRLICH: im Binary vorhanden, NICHT per Mitschnitt getestet ---
+    # Loeschen Daten auf der SD. Nur bewusst verwenden.
+    def format_disk_DANGER(self):  return self.button("j")   # SD formatieren
+    def clear_cache_DANGER(self):  return self.button("k")   # Cache leeren
+
+    # 'b'-Toggles: 'b' + [wert, ctx1, ctx2, id]. wert/id aus den Handlern,
+    # in den Einzel-Mitschnitten bestaetigt. ctx1/ctx2 sind Reste des
+    # Uptime-Zaehlers der App; das Geraet wertet fuer diese Kommandos nur
+    # wert+id aus (ctx2 war stets 0x01). Falls ein Geraet zickt, ctx1 auf
+    # den zuletzt empfangenen Uptime-Wert setzen.
+    CTX1 = 0x00
+    CTX2 = 0x01
+
+    def _btoggle(self, val: int, pid: int, read: bool = True) -> bytes:
+        payload = bytes([ord("b"), val & 0xFF, self.CTX1, self.CTX2, pid & 0xFF])
+        return self.command(payload, read)
+
+    def clock(self, on: bool):
+        """Uhr einschalten (on=True) oder ausschalten (id=2). on=1, off=0."""
+        return self._btoggle(1 if on else 0, 2)
+
+    def needle_color(self, white: bool):
+        """Zeigerfarbe weiss (True) oder schwarz (id=3). white=1, black=0."""
+        return self._btoggle(1 if white else 0, 3)
+
+    DIAL_MODES = {"digital": 0, "symbol": 1, "constellation": 2, "zodiac": 3}
+
+    def dial(self, mode: str):
+        """Zifferblatt: digital | symbol | constellation | zodiac (id=4)."""
+        return self._btoggle(self.DIAL_MODES[mode.lower()], 4)
+
+    def set_clock_time(self, hour: int, minute: int, second: int = 0):
+        """
+        Uhrzeit der Uhr setzen. Verifiziert: 'b' + Sekunden-seit-Mitternacht
+        (24-bit little-endian) + id=1.
+        (Mitschnitt: 07:34:00 -> 68 6a 00, 08:00:00 -> 80 70 00.)
+        """
+        secs = (int(hour) * 3600 + int(minute) * 60 + int(second)) % 86400
+        payload = bytes([ord("b"), secs & 0xFF, (secs >> 8) & 0xFF,
+                         (secs >> 16) & 0xFF, 0x01])
+        return self.command(payload)
+
+    # set_duration(seconds) = 'C' + n  (oben, verifiziert)
+
+    def probe_letters(self, letters: Optional[str] = None,
+                      delay: float = 1.0) -> None:
+        """Sichere Button-Buchstaben nacheinander senden (ohne j/k!)."""
+        for c in (letters or self.SAFE_LETTERS):
+            self.button(c)
+            print(f"  gesendet: '{c}'  ({self.frame(c.encode()).hex(' ')})")
+            time.sleep(delay)
+
+
+# ---- Parser (standalone, ohne Socket) ----------------------------------
+def parse_file_list(resp: bytes) -> tuple[List[FanFile], Optional[FanStatus]]:
+    """
+    Zerlegt eine Listenantwort.
+
+    Struktur (verifiziert):
+      HEAD
+      0x00 'gpi'                      (4-Byte-Tag)
+      N x  [len:1][name: len Bytes GBK]   (Dateinamen, evtl. mit fuehrender Ziffer)
+      [len:1][0x?? 00 00 00 fl fl fl]     Status-Trailer: erstes Byte = Dateianzahl
+      00-Padding
+      FOOT
+    """
+    if not (resp.startswith(HEAD) and FOOT in resp):
+        raise ValueError("keine gueltige HEAD/FOOT-Antwort")
+    body = resp[len(HEAD):resp.index(FOOT)]
+
+    # 4-Byte-Tag ueberspringen (0x00 'gpi'); defensiv, falls kuenftig anders
+    off = 4 if body[:1] == b"\x00" else 0
+
+    files: List[FanFile] = []
+    status: Optional[FanStatus] = None
+    i = off
+    n = len(body)
+    while i < n:
+        ln = body[i]
+        if ln == 0 or i + 1 + ln > n:
             break
-        elif cmd == "on":
-            fan.power_on()
-        elif cmd == "off":
-            fan.power_off()
-        elif cmd == "play":
-            fan.play()
-        elif cmd == "stop":
-            fan.stop()
-        elif cmd == "pause":
-            fan.pause()
-        elif cmd == "next":
-            fan.next_video()
-        elif cmd in ("prev", "previous"):
-            fan.previous_video()
-        elif cmd.startswith("speed "):
+        chunk = body[i + 1:i + 1 + ln]
+        # Trailer erkennen: Namen sind reine GBK-Zeichen (>=0x20 oder GBK-Highbyte);
+        # der Status-Block enthaelt Nullbytes im Innern.
+        if b"\x00" in chunk:
+            status = FanStatus(file_count=chunk[0], flags=chunk[1:])
+            i += 1 + ln
+            continue
+        try:
+            name = chunk.decode("gbk")
+        except UnicodeDecodeError:
+            break
+        index = None
+        if name and name[0].isdigit():
+            j = 0
+            while j < len(name) and name[j].isdigit():
+                j += 1
             try:
-                fan.set_speed(int(cmd.split()[1]))
-            except (ValueError, IndexError):
-                print("⚠️   Syntax: speed <1-5>")
-        elif cmd.startswith("bright "):
-            fan.set_brightness(cmd.split()[1])
-        elif cmd.startswith("index "):
-            try:
-                fan.play_file_by_index(int(cmd.split()[1]))
-            except (ValueError, IndexError):
-                print("⚠️   Syntax: index <nummer>")
-        elif cmd.startswith("raw "):
-            try:
-                raw = bytes.fromhex(cmd[4:].replace(" ", ""))
-                fan.send_raw(raw)
+                index = int(name[:j])
             except ValueError:
-                print("⚠️   Ungültiger Hex-String. Beispiel: raw 5B 01 00")
-        elif cmd.startswith("upload "):
-            fan.upload_file_ftp(cmd[7:].strip())
-        elif cmd == "list":
-            fan.list_files_ftp()
-        elif cmd == "":
-            pass
-        else:
-            print(f"⚠️   Unbekannter Befehl: '{cmd}'")
+                index = None
+        files.append(FanFile(name=name, index=index, raw=chunk))
+        i += 1 + ln
+    return files, status
 
 
-# ─────────────────────────────────────────────────────────────────
-#  Hauptprogramm
-# ─────────────────────────────────────────────────────────────────
+# ---- Selbsttest gegen echten Mitschnitt --------------------------------
+_REAL_CAPTURE = bytes.fromhex(
+    "43 30 45 45 42 37 43 39 42 41 41 33 00 67 70 69 03 30 d3 e3 05 31 ba fc"
+    " c0 ea 05 32 bf d6 c1 fa 05 33 c9 f1 ca de 06 34 54 49 47 45 52 05 36 b5"
+    " c6 c1 fd 03 37 b4 ba 05 39 c6 fb b3 b5 04 b7 bf d7 d3 02 c1 b3 06 c2 ed"
+    " c0 ef b0 c2 04 ce f7 b9 cf 07 0c 00 00 00 01 00 01 00 00 00 00 00 00 00"
+    " 00 43 30 45 45 42 44 46 39 45 35 42 37".replace(" ", "")
+)
+
+
+def test_parse() -> None:
+    files, status = parse_file_list(_REAL_CAPTURE)
+    for f in files:
+        print(f"  {f}")
+    assert len(files) == 12, f"erwartet 12, erhalten {len(files)}"
+    assert status is not None and status.file_count == 12
+    assert files[0].name == "0鱼" and files[0].index == 0
+    assert files[4].name == "4TIGER" and files[4].index == 4
+    print(f"OK: {len(files)} Dateien, Status.count={status.file_count}, "
+          f"flags={status.flags.hex(' ')}")
+    # check3-Arithmetik gegen die aus dem Binary abgeleiteten Werte
+    assert HologramFan._check3(1) == bytes.fromhex("006363")
+    assert HologramFan._check3(2) == bytes.fromhex("006364")
+    assert HologramFan._check3(5) == bytes.fromhex("006367")
+    print("OK: check3(1/2/5) =", *(HologramFan._check3(n).hex() for n in (1, 2, 5)))
+
+
+def _shell(fan: "HologramFan") -> None:
+    """Interaktive Sitzung: Verbindung bleibt warm, Kommandos eintippen."""
+    cmds = {
+        "on-off": fan.on_off, "next": fan.next_one, "prev": fan.last_one,
+        "play-pause": fan.play_pause, "list-loop": fan.list_loop,
+        "single-loop": fan.single_loop, "bright-up": fan.brightness_up,
+        "bright-down": fan.brightness_down, "cw": fan.cw_adjust,
+        "ccw": fan.ccw_adjust,
+    }
+    print("Verbinde (warme Sitzung, Keepalive laeuft)...")
+    fan.open()
+    files, status = parse_file_list(fan._last_rx) if fan._last_rx else ([], None)
+    print(f"Verbunden mit {fan.ip}:{fan.port}."
+          + (f" {len(files)} Animationen." if files else ""))
+    print("Befehle: " + ", ".join(cmds) + ", clock on|off, needle white|black,")
+    print("         dial <modus>, time HH:MM, duration <5-30>, button <x>, raw <hex>, quit")
+    try:
+        while True:
+            try:
+                line = input("fan> ").strip()
+            except EOFError:
+                break
+            if not line:
+                continue
+            parts = line.split()
+            c = parts[0].lower()
+            try:
+                if c in ("quit", "exit", "q"):
+                    break
+                elif c in cmds:
+                    cmds[c]()
+                elif c == "clock":
+                    fan.clock(parts[1] == "on")
+                elif c == "needle":
+                    fan.needle_color(parts[1] == "white")
+                elif c == "dial":
+                    fan.dial(parts[1])
+                elif c == "time":
+                    hms = [int(x) for x in parts[1].split(":")] + [0, 0]
+                    fan.set_clock_time(hms[0], hms[1], hms[2])
+                elif c == "duration":
+                    fan.set_duration(int(parts[1]))
+                elif c == "button":
+                    fan.button(parts[1])
+                elif c == "raw":
+                    fan.command(bytes.fromhex(parts[1]))
+                elif c == "list":
+                    fl, st = parse_file_list(fan._last_rx) if fan._last_rx else ([], None)
+                    for f in fl:
+                        print(f"  {f}")
+                else:
+                    print("unbekannt")
+                print("  ok")
+            except (IndexError, ValueError) as e:
+                print(f"  Eingabefehler: {e}")
+    finally:
+        fan.close()
+        print("Verbindung geschlossen.")
+
+
+def _cli(argv=None):
+    import argparse
+    p = argparse.ArgumentParser(
+        description="Steuerung fuer 3D-Hologramm-Luefter (3D_42CM..., Port 20320).")
+    p.add_argument("--ip", default=DEFAULT_IP)
+    p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p.add_argument("--timeout", type=float, default=3.0)
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="gesendete/empfangene Frames anzeigen")
+    sub = p.add_subparsers(dest="cmd")
+
+    sub.add_parser("selftest", help="Parser/Framing offline pruefen (ohne Geraet)")
+    sub.add_parser("list", help="Animationsliste lesen")
+    sub.add_parser("shell", help="Interaktiv: warme Sitzung offen halten, Kommandos eintippen")
+
+    # --- Steuerung (per PCAP verifiziert) ---
+    sub.add_parser("on-off",         help="Projektor an/aus (Toggle)")
+    sub.add_parser("play-pause",     help="Video Play/Pause (Toggle)")
+    sub.add_parser("next",           help="Naechstes Video")
+    sub.add_parser("prev",           help="Vorheriges Video")
+    sub.add_parser("list-loop",      help="Alle Videos in Schleife")
+    sub.add_parser("single-loop",    help="Einzelnes Video in Schleife")
+    sub.add_parser("bright-up",      help="Helligkeit +")
+    sub.add_parser("bright-down",    help="Helligkeit -")
+    sub.add_parser("cw",             help="Drehung im Uhrzeigersinn")
+    sub.add_parser("ccw",            help="Drehung gegen Uhrzeigersinn")
+    st = sub.add_parser("set-time", help="Uhrzeit der Uhr setzen, z.B. 12:30")
+    st.add_argument("time", help="HH:MM oder HH:MM:SS")
+
+    ck = sub.add_parser("clock", help="Uhr an/aus")
+    ck.add_argument("state", choices=["on", "off"])
+    nd = sub.add_parser("needle", help="Zeigerfarbe")
+    nd.add_argument("color", choices=["white", "black"])
+    di = sub.add_parser("dial", help="Zifferblatt-Modus")
+    di.add_argument("mode", choices=["digital", "symbol", "constellation", "zodiac"])
+    d = sub.add_parser("duration", help="Videodauer 5..30 s setzen")
+    d.add_argument("seconds", type=int)
+
+    # --- Diagnose / Entwicklung ---
+    b = sub.add_parser("button", help="1-Byte-Button roh senden (a c d e g h l m p q; j/k = Format/Clear)")
+    b.add_argument("letter")
+    b.add_argument("-n", type=int, default=1, help="mehrfach senden")
+    r = sub.add_parser("raw", help="Hex-Payload rahmen und senden (ohne HEAD/FOOT)")
+    r.add_argument("hex", help='z.B. "64" (Button d) oder "6295020100"')
+
+    args = p.parse_args(argv)
+
+    if args.cmd == "selftest" or args.cmd is None and False:
+        test_parse(); return
+    if args.cmd is None:
+        args.cmd = "list"
+    if args.cmd == "selftest":
+        test_parse(); return
+
+    try:
+        fan = HologramFan(args.ip, args.port, args.timeout,
+                          verbose=getattr(args, "verbose", False))
+        named = {
+            "on-off": fan.on_off, "next": fan.next_one, "prev": fan.last_one,
+            "play-pause": fan.play_pause, "list-loop": fan.list_loop,
+            "single-loop": fan.single_loop, "bright-up": fan.brightness_up,
+            "bright-down": fan.brightness_down, "cw": fan.cw_adjust,
+            "ccw": fan.ccw_adjust,
+        }
+        if args.cmd == "shell":
+            _shell(fan); return
+        if args.cmd == "list":
+            files, status = fan.get_file_list()
+            print(f"Verbunden mit {fan.ip}:{fan.port} — {len(files)} Animationen"
+                  + (f", count={status.file_count}" if status else ""))
+            for f in files:
+                print(f"  {f}")
+        elif args.cmd in named:
+            named[args.cmd]()
+            print(f"'{args.cmd}' gesendet.")
+        elif args.cmd == "clock":
+            fan.clock(args.state == "on");  print(f"Uhr {args.state}.")
+        elif args.cmd == "needle":
+            fan.needle_color(args.color == "white"); print(f"Zeiger {args.color}.")
+        elif args.cmd == "dial":
+            fan.dial(args.mode); print(f"Zifferblatt: {args.mode}.")
+        elif args.cmd == "set-time":
+            parts = [int(x) for x in args.time.split(":")]
+            while len(parts) < 3:
+                parts.append(0)
+            fan.set_clock_time(*parts[:3])
+            print(f"Uhrzeit gesetzt: {parts[0]:02d}:{parts[1]:02d}:{parts[2]:02d}")
+        elif args.cmd == "button":
+            for i in range(args.n):
+                fan.button(args.letter)
+                if i + 1 < args.n:
+                    time.sleep(0.3)
+            print(f"gesendet: '{args.letter}' x{args.n} "
+                  f"({fan.frame(args.letter.encode()).hex(' ')})")
+        elif args.cmd == "duration":
+            fan.set_duration(args.seconds)
+            print(f"Videodauer -> {max(5, min(30, args.seconds))} s")
+        elif args.cmd == "raw":
+            payload = bytes.fromhex(args.hex)
+            resp = fan.command(payload, read=True)
+            print(f"gesendet: {fan.frame(payload).hex(' ')}")
+            if resp:
+                print(f"Antwort ({len(resp)} B): {resp[:32].hex(' ')}...")
+        fan.close()
+    except OSError as e:
+        print(f"Verbindung fehlgeschlagen ({e}). Mit WLAN 3D_42CM_... verbunden? "
+              f"Offline-Test: python hologram_fan.py selftest")
+
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Hologramm-Ventilator Python-Steuerung"
-    )
-    parser.add_argument(
-        "--host",
-        default="10.10.10.1",
-        help="IP-Adresse des Geräts (Standard: 10.10.10.1 im Hotspot-Modus)"
-    )
-    parser.add_argument(
-        "--discover",
-        metavar="SUBNETZ",
-        help="Geräte suchen, z.B. --discover 192.168.178"
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=50200,
-        help="TCP-Port (Standard: 50200)"
-    )
-    args = parser.parse_args()
-
-    if args.discover:
-        found = HologramFan.discover(args.discover)
-        if found:
-            print(f"\nGefundene Geräte: {found}")
-            print(f"Tipp: Starte mit --host {found[0]}")
+    import sys
+    if "--selftest" in sys.argv:            # Rueckwaertskompatibel
+        test_parse()
     else:
-        fan = HologramFan(args.host, args.port)
-        if fan.connect():
-            interactive_cli(fan)
-            fan.disconnect()
-        else:
-            print("\n💡 Tipps:")
-            print("  1. Verbinde deinen PC mit dem WLAN-Hotspot des Geräts.")
-            print("     Dann ist die IP automatisch 10.10.10.1")
-            print("  2. Oder verbinde Gerät + PC im selben Heimnetz und")
-            print("     lies die IP aus deinem Router-DHCP ab.")
-            print("  3. Aktiviere 'Third-Party Control' in den Geräteeinstellungen!")
-            print(f"  4. Suche mit: python hologram_fan.py --discover 192.168.178")
+        _cli()
