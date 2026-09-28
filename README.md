@@ -1,6 +1,6 @@
 # Hologram Fan Projector – Python Tools
 
-Python tools for a 3D hologram fan (POV / LED‑blade display) of the
+Python tools for a 3D hologram fan projector (POV / LED‑blade display) of the
 **`3D_42CM_…`** type, as shipped with the Windows app *"电脑软件 V13.0 /
 Windows App V13.0"*. The protocol was reconstructed by reverse‑engineering the
 original binary and from Wireshark captures; all control commands are verified
