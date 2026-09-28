@@ -1,67 +1,75 @@
-# Hologram Fan Projector – Python-Steuerung
+# Hologram Fan Projector – Python Tools
 
-Python-Client zur Steuerung eines 3D-Hologramm-Lüfters (POV-/LED-Blade-Display)
-der Bauart **`3D_42CM_…`**, wie er mit der Windows-App *„电脑软件 V13.0 / Windows
-App V13.0"* ausgeliefert wird. Das Protokoll wurde per Reverse-Engineering des
-Original-Binaries und aus Wireshark-Mitschnitten rekonstruiert; alle Kommandos
-sind byte-genau gegen echten Traffic verifiziert.
+Python tools for a 3D hologram fan (POV / LED‑blade display) of the
+**`3D_42CM_…`** type, as shipped with the Windows app *"电脑软件 V13.0 /
+Windows App V13.0"*. The protocol was reconstructed by reverse‑engineering the
+original binary and from Wireshark captures; all control commands are verified
+byte‑for‑byte against real traffic.
 
-Keine externen Abhängigkeiten – nur die Python-Standardbibliothek.
+Two tools are included:
 
-## Voraussetzungen
+- **`hologram_fan.py`** – control the device over Wi‑Fi (play/pause, next,
+  brightness, clock, dial, …). No external dependencies (standard library only).
+- **`hologram_bin.py`** – convert between video and the device's `.BIN` clip
+  format (encoder / decoder). Requires `numpy` and `opencv-python-headless`.
 
-- Python 3.8 oder neuer
-- Ein WLAN-Adapter, um sich mit dem Access Point des Geräts zu verbinden
-- Das Skript `hologram_fan.py`
+---
 
-## Verbindung herstellen
+# Part 1 — Device control (`hologram_fan.py`)
 
-Der Lüfter spannt ein eigenes WLAN auf (SSID z. B. `3D_42CM_51ABDC`). Im
-AP-Modus ist das Gerät ein TCP-Server:
+## Requirements
 
-| Parameter | Wert |
-|-----------|------|
-| SSID | `3D_42CM_…` (gerätespezifisch) |
+- Python 3.8 or newer
+- A Wi‑Fi adapter to join the device's access point
+- The script `hologram_fan.py`
+
+## Connecting
+
+The fan opens its own Wi‑Fi network (SSID e.g. `3D_42CM_51ABDC`). In AP mode the
+device is a TCP server:
+
+| Parameter | Value |
+|-----------|-------|
+| SSID | `3D_42CM_…` (device‑specific) |
 | IP | `192.168.4.1` |
 | Port | `20320` |
 
-1. Am Rechner mit dem WLAN `3D_42CM_…` verbinden.
-2. Prüfen, ob die Verbindung steht:
+1. Connect your computer to the `3D_42CM_…` Wi‑Fi.
+2. Check the connection:
 
 ```
 python hologram_fan.py list
 ```
 
-Erwartete Ausgabe (die 12 Animationen auf der SD-Karte):
+Expected output (the 12 animations on the SD card):
 
 ```
-Verbunden mit 192.168.4.1:20320 — 12 Animationen
+Connected to 192.168.4.1:20320 — 12 animations
   [0] 0鱼
   [1] 1狐狸
   ...
 ```
 
-Kommt diese Liste, ist alles korrekt verbunden. Ohne Geräteverbindung lässt sich
-das Framing offline prüfen mit `python hologram_fan.py selftest`.
+If this list appears, everything is connected correctly. Without a device you
+can still check the framing offline with `python hologram_fan.py selftest`.
 
-## Bedienung
+## Usage
 
-Das Gerät hält im Original eine **dauerhafte, „warme" Verbindung** und pollt
-ständig; ein einzeln gesendetes Kommando auf einer sofort wieder geschlossenen
-Verbindung wird ignoriert. Der Client bildet dieses Verhalten nach: jede
-Kommando-Ausführung öffnet eine kurze warme Sitzung (Handshake + Keepalive) und
-sendet das Kommando mehrfach.
+In the original app the device holds a **persistent, "warm" connection** and
+polls continuously; a single command sent on a connection that is closed again
+immediately is ignored. The client mimics this: each command execution opens a
+short warm session (handshake + keepalive) and sends the command several times.
 
-### Interaktiver Modus (empfohlen)
+### Interactive mode (recommended)
 
-Am zuverlässigsten ist die interaktive Shell, weil sie die Verbindung dauerhaft
-warm hält:
+The interactive shell is the most reliable option because it keeps the
+connection warm the whole time:
 
 ```
 python hologram_fan.py shell
 ```
 
-Danach Befehle direkt eintippen:
+Then type commands directly:
 
 ```
 fan> on-off
@@ -73,9 +81,9 @@ fan> duration 15
 fan> quit
 ```
 
-### Einzelbefehle
+### Single commands
 
-Jeder Befehl kann auch direkt aufgerufen werden:
+Every command can also be called directly:
 
 ```
 python hologram_fan.py on-off
@@ -86,127 +94,192 @@ python hologram_fan.py set-time 12:30
 python hologram_fan.py duration 15
 ```
 
-### Befehlsübersicht
+### Command reference
 
-Alle folgenden Funktionen sind per Mitschnitt verifiziert.
+All of the following functions are verified from captures.
 
-| Befehl | Wirkung | Hinweis |
-|--------|---------|---------|
-| `on-off` | Projektor an/aus | Toggle (ein Button, kein separates on/off) |
-| `play-pause` | Video abspielen/pausieren | Toggle |
-| `next` | Nächstes Video | |
-| `prev` | Vorheriges Video | |
-| `list-loop` | Alle Videos in Schleife | |
-| `single-loop` | Einzelnes Video in Schleife | |
-| `bright-up` | Helligkeit + | |
-| `bright-down` | Helligkeit − | |
-| `cw` | Drehung im Uhrzeigersinn | |
-| `ccw` | Drehung gegen Uhrzeigersinn | |
-| `clock on` / `clock off` | Uhr ein-/ausblenden | |
-| `needle white` / `needle black` | Zeigerfarbe | |
-| `dial <modus>` | Zifferblatt: `digital`, `symbol`, `constellation`, `zodiac` | |
-| `set-time HH:MM` | Uhrzeit der Uhr setzen | auch `HH:MM:SS` |
-| `duration <5–30>` | Anzeigedauer je Video in Sekunden | wird auf 5–30 begrenzt |
+| Command | Effect | Note |
+|---------|--------|------|
+| `on-off` | Projector on/off | Toggle (one button, no separate on/off) |
+| `play-pause` | Play / pause video | Toggle |
+| `next` | Next video | |
+| `prev` | Previous video | |
+| `list-loop` | Loop all videos | |
+| `single-loop` | Loop a single video | |
+| `bright-up` | Brightness + | |
+| `bright-down` | Brightness − | |
+| `cw` | Rotate clockwise | |
+| `ccw` | Rotate counter‑clockwise | |
+| `clock on` / `clock off` | Show / hide the clock | |
+| `needle white` / `needle black` | Needle colour | |
+| `dial <mode>` | Dial face: `digital`, `symbol`, `constellation`, `zodiac` | |
+| `set-time HH:MM` | Set the clock time | `HH:MM:SS` also accepted |
+| `duration <5–30>` | Display time per video, in seconds | clamped to 5–30 |
 
-**Toggle vs. Auswahl:** `on-off` und `play-pause` sind Umschalter – es gibt
-bewusst kein getrenntes „on"/„off", weil die App dafür nur einen einzigen Button
-sendet. Nur `clock`, `needle` und `dial` haben echte Zustandswerte und erwarten
-deshalb ein Argument.
+**Toggle vs. selection:** `on-off` and `play-pause` are toggles – there is
+deliberately no separate "on"/"off", because the app sends only a single button
+for them. Only `clock`, `needle` and `dial` have real state values and therefore
+take an argument.
 
-### Diagnose
+### Diagnostics
 
-| Befehl | Zweck |
-|--------|-------|
-| `list` | Animationsliste lesen |
-| `selftest` | Framing/Parser offline prüfen |
-| `button <x>` | Einen rohen 1-Byte-Button senden |
-| `raw <hex>` | Beliebige Payload rahmen und senden |
+| Command | Purpose |
+|---------|---------|
+| `list` | Read the animation list |
+| `selftest` | Check framing/parser offline |
+| `button <x>` | Send a single raw 1‑byte button |
+| `raw <hex>` | Frame and send an arbitrary payload |
 
-Globale Option `-v` / `--verbose` zeigt jeden gesendeten (`TX`) und empfangenen
-(`LISTE`/`RX`) Frame – nützlich, wenn etwas nicht reagiert:
+The global option `-v` / `--verbose` prints every sent (`TX`) and received
+(`LIST`/`RX`) frame – useful when nothing seems to happen:
 
 ```
 python hologram_fan.py -v shell
 ```
 
-## Konfiguration
+## Configuration
 
-Globale Optionen (vor dem Befehl):
+Global options (before the command):
 
-| Option | Standard | Beschreibung |
-|--------|----------|--------------|
-| `--ip` | `192.168.4.1` | IP des Geräts |
-| `--port` | `20320` | TCP-Port |
-| `--timeout` | `3.0` | Socket-Timeout in Sekunden |
-| `-v`, `--verbose` | aus | Frames mitschreiben |
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--ip` | `192.168.4.1` | Device IP |
+| `--port` | `20320` | TCP port |
+| `--timeout` | `3.0` | Socket timeout in seconds |
+| `-v`, `--verbose` | off | Log frames |
 
-Beispiel:
+Example:
 
 ```
 python hologram_fan.py --ip 192.168.4.1 --port 20320 -v duration 20
 ```
 
-## Als Bibliothek verwenden
+## Using it as a library
 
 ```python
 from hologram_fan import HologramFan
 
-with HologramFan() as fan:          # öffnet eine warme Sitzung
+with HologramFan() as fan:          # opens a warm session
     files, status = fan.get_file_list()
     for f in files:
-        print(f)                    # z. B. "[4] 4TIGER"
+        print(f)                    # e.g. "[4] 4TIGER"
 
     fan.on_off()
     fan.next_one()
-    fan.clock(True)                 # Uhr an
-    fan.needle_color(white=False)   # Zeiger schwarz
+    fan.clock(True)                 # clock on
+    fan.needle_color(white=False)   # needle black
     fan.dial("zodiac")
     fan.set_clock_time(12, 30)      # 12:30:00
-    fan.set_duration(15)            # 15 s je Video
+    fan.set_duration(15)            # 15 s per video
 ```
 
-Ohne Kontextmanager öffnet jeder Kommando-Aufruf selbst kurz eine warme Sitzung;
-für viele Kommandos in Folge ist der Kontextmanager (oder `fan.open()` …
-`fan.close()`) effizienter.
+Without the context manager, each command call opens a short warm session
+itself; for many commands in a row the context manager (or `fan.open()` …
+`fan.close()`) is more efficient.
 
-## Protokoll (Kurzreferenz)
+## Protocol (quick reference)
 
-- **Transport:** TCP, Gerät ist AP-Server auf `192.168.4.1:20320`.
-- **Rahmen:** jedes Kommando ist `HEAD + check3 + payload + FOOT` als
-  ASCII-Bytes, mit
+- **Transport:** TCP, the device is an AP server on `192.168.4.1:20320`.
+- **Frame:** every command is `HEAD + check3 + payload + FOOT` as ASCII bytes:
   - `HEAD = "C0EEB7C9BAA3"`
   - `FOOT = "C0EEBDF9E5B7"`
-  - `check3` = drei Prüfbytes, die nur von der Payload-Länge abhängen
+  - `check3` = three check bytes that depend only on the payload length
     (`len 1 → 00 63 63`, `2 → 00 63 64`, `5 → 00 63 67`).
-- **Handshake:** nur `HEAD+FOOT` senden → Gerät liefert die Datei-/Animationsliste.
-  Das Gerät sendet diese Liste außerdem periodisch von selbst.
-- **Kommandoformen:**
-  - 1-Byte-Buttons: `a` On/Off, `c` Next, `d` Prev, `e` Play/Pause, `g`
-    Single-Loop, `h` List-Loop, `l` Helligkeit−, `m` Helligkeit+, `p` CW, `q` CCW.
-  - Videodauer: `C` + 1 Byte Sekunden (5–30).
-  - Einstellungen: `b` + `[wert, ctx, ctx, id]` mit `id` 2=Uhr, 3=Zeiger,
-    4=Zifferblatt.
-  - Uhrzeit: `b` + Sekunden-seit-Mitternacht (24-bit little-endian) + `id 1`.
+- **Handshake:** send only `HEAD+FOOT` → the device returns the file/animation
+  list. The device also sends this list periodically on its own.
+- **Command forms:**
+  - 1‑byte buttons: `a` on/off, `c` next, `d` prev, `e` play/pause, `g`
+    single‑loop, `h` list‑loop, `l` brightness−, `m` brightness+, `p` CW, `q` CCW.
+  - Video duration: `C` + 1 byte seconds (5–30).
+  - Settings: `b` + `[value, ctx, ctx, id]` with `id` 2 = clock, 3 = needle,
+    4 = dial.
+  - Clock time: `b` + seconds‑since‑midnight (24‑bit little‑endian) + `id 1`.
 
-## Bekannte Grenzen
+## Known limitations
 
-- **BIN-Upload / „Decode video"** sind noch nicht implementiert – dafür fehlt der
-  Mitschnitt einer erfolgreichen Übertragung.
-- **`Format Disk` (Button `j`) und `Clear Cache` (Button `k`)** sind aus dem
-  Binary bekannt, aber **nicht per Mitschnitt verifiziert**. Sie sind bewusst
-  nicht als reguläre Befehle eingebunden. `Format Disk` löscht die SD-Karte –
-  nur bewusst über `button j` verwenden.
-- `set-time` ist für die getesteten Uhrzeiten verifiziert; die 24-Bit-Kodierung
-  deckt den vollen Tagesbereich ab.
-- Die App tolerierte je nach Firmware nur eine aktive Verbindung. Läuft parallel
-  die Original-Windows-App, sollte sie geschlossen sein.
+- **BIN upload / "Decode video"** are not implemented here – a capture of a
+  successful transfer is missing.
+- **`Format Disk` (button `j`) and `Clear Cache` (button `k`)** are known from
+  the binary but **not verified from a capture**. They are deliberately not wired
+  in as regular commands. `Format Disk` erases the SD card – use it only
+  intentionally via `button j`.
+- `set-time` is verified for the times tested; the 24‑bit encoding covers the
+  full day range.
+- Depending on firmware, the device tolerated only one active connection. If the
+  original Windows app is running in parallel, close it.
 
-## Fehlerbehebung
+## Troubleshooting
 
-- **„Verbindung fehlgeschlagen":** WLAN `3D_42CM_…` verbunden? IP `192.168.4.1`
-  erreichbar? Original-App geschlossen?
-- **Befehl wird angenommen, aber am Gerät passiert nichts:** mit `-v` prüfen, ob
-  `LISTE`-Zeilen ankommen (Sitzung lebt) und `TX`-Zeilen rausgehen. Der
-  `shell`-Modus hält die Sitzung am zuverlässigsten warm.
-- **`list` zeigt mal 12, mal 13 Einträge:** kosmetisch – der Status-Trailer wird
-  je nach Timing als zusätzlicher Eintrag gelesen; die 12 Namen stimmen immer.
+- **"Connection failed":** Connected to the `3D_42CM_…` Wi‑Fi? Is `192.168.4.1`
+  reachable? Is the original app closed?
+- **Command accepted but nothing happens on the device:** use `-v` to check that
+  `LIST` lines arrive (session is alive) and `TX` lines go out. The `shell` mode
+  keeps the session warm most reliably.
+- **`list` shows 12 or 13 entries at times:** cosmetic – the status trailer is
+  sometimes read as an extra entry depending on timing; the 12 names are always
+  correct.
+
+---
+
+# Part 2 — Video / BIN conversion (`hologram_bin.py`)
+
+Converts between ordinary video and the device's `.BIN` clip format, so you can
+put your own clips on the fan (e.g. a downloaded clip, or a red/cyan **anaglyph**
+video for glasses‑based 3D). The format was reconstructed from a known
+video → BIN calibration pair produced with the original app.
+
+## Requirements
+
+```
+pip install numpy opencv-python-headless
+```
+
+## Usage
+
+```
+python hologram_bin.py encode video.mp4 -o out.bin     # video  -> BIN
+python hologram_bin.py decode clip.bin  -o out.mp4      # BIN    -> preview video
+python hologram_bin.py decode clip.bin  --png frames/   # BIN    -> individual PNGs
+python hologram_bin.py info  clip.bin                   # show frame count / layout
+```
+
+`decode` is handy for inspecting what is stored on the SD card; `encode`
+produces a `.BIN` you can copy to the SD card (or upload with the original app).
+
+## The BIN format (reverse‑engineered)
+
+| Property | Value |
+|----------|-------|
+| File | sequence of frames of **129024 bytes** (some files add a 20‑byte trailer) |
+| Frame | **512 angles × 252 bytes** |
+| 252 bytes | **6 groups × 42 radius** (planar); byte index `p` → group `p // 42`, radius `p % 42` |
+| Radius | inverted: index 0 = outer edge, index 41 = centre |
+| Frame rate | the app samples **every 2nd** video frame (24 fps → 12 fps) |
+| Colour | groups 0–3 = luminance (R+G+B), group 4 = R+G, group 5 = G+B (a YUV‑like coding) |
+| Geometry | a 16:9 video is mapped as an ellipse into the circle |
+
+Base colours (pure red / green / blue) are reproduced byte‑exactly; the decoder
+recovers shapes faithfully (the animations are clearly recognisable).
+
+## Known limitations
+
+The encoder produces structurally correct, playable BINs, but is **not yet
+byte‑identical** to the original app for full images, because two details are not
+fully reproduced:
+
+- a **non‑linear saturation / white‑balance curve** the app applies to mixed and
+  low‑saturation colours (this can give a slight colour cast in flat areas), and
+- the app's **dithering** (it spreads colour over 0/255 pixels; this encoder
+  writes continuous values).
+
+Both affect exact colour fidelity, not the basic function. The **angle origin**
+(`ANGLE_OFFSET` in the script) can be adjusted if the image appears rotated.
+
+## Recommended workflows
+
+- **Simplest, already working:** create your clip (e.g. an anaglyph video) and
+  convert it with the **original Windows app** (`Decode video`), which is proven
+  to produce correct BINs. Use `hologram_bin.py decode` to preview any BIN.
+- **Fully in Python (experimental):** `hologram_bin.py encode video.mp4 -o
+  out.bin`, copy `out.bin` to the SD card, and test on the device. If it plays
+  (even with a colour shift), saturation and dithering can be refined next.
